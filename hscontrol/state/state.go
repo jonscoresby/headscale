@@ -229,6 +229,27 @@ func NewState(cfg *types.Config) (*State, error) {
 		return nil, fmt.Errorf("initializing policy manager: %w", err)
 	}
 
+	// Cross-file consistency: DNS may be configured in at most one of
+	// headscale.yaml's legacy dns block and the policy's dns block. If
+	// both are set, refuse to start. The tailnet-wide magic_dns block in
+	// headscale.yaml is independent and always allowed.
+	//
+	// We consult cfg.DNSPresence (populated at config load via
+	// viper.InConfig + env-var lookup) rather than a value-based check
+	// because viper.SetDefault would otherwise make the check fire on
+	// every default install.
+	yamlDNSPresent := cfg.DNSPresence.LegacyDNSBlockPresent
+	if yamlDNSPresent && polMan.HasDNSConfig() {
+		return nil, fmt.Errorf(
+			"DNS configured in both headscale.yaml (legacy `dns:` block) " +
+				"and the policy file (`dns:` block); these are mutually " +
+				"exclusive. Remove one — the policy `dns:` block is the " +
+				"preferred location (hot-reloadable, per-principal profiles)")
+	}
+	// Record the yaml DNS state so subsequent hot-reloads that would
+	// introduce a policy.dns block are rejected before mutating state.
+	polMan.SetYAMLDNSPresent(yamlDNSPresent)
+
 	// Apply defaults for [NodeStore] batch configuration if not set.
 	// This ensures tests that create Config directly (without viper) still work.
 	batchSize := cfg.Tuning.NodeStoreBatchSize
@@ -1043,6 +1064,13 @@ func (s *State) ExpireExpiredNodes(lastCheck time.Time) (time.Time, []change.Cha
 // SSHPolicy returns the SSH access policy for a node.
 func (s *State) SSHPolicy(node types.NodeView) (*tailcfg.SSHPolicy, error) {
 	return s.polMan.SSHPolicy(s.cfg.ServerURL, node)
+}
+
+// NodeDNSConfig returns the DNSConfig for a node, replacing the supplied
+// policy-wide base with the node's matched DNS profile (if any) from the
+// policy's dns block. See [policy.PolicyManager] for the matching rules.
+func (s *State) NodeDNSConfig(node types.NodeView, base *tailcfg.DNSConfig) *tailcfg.DNSConfig {
+	return s.polMan.NodeDNSConfig(node, base, s.cfg.BaseDomain)
 }
 
 // SSHCheckParams resolves the SSH check period for a source-destination

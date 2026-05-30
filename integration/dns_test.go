@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	policyv2 "github.com/juanfont/headscale/hscontrol/policy/v2"
 	"github.com/juanfont/headscale/integration/hsic"
 	"github.com/juanfont/headscale/integration/integrationutil"
 	"github.com/juanfont/headscale/integration/tsic"
@@ -220,5 +221,164 @@ func TestResolveMagicDNSExtraRecordsPath(t *testing.T) {
 
 	for _, client := range allClients {
 		assertCommandOutputContains(t, client, []string{"dig", "copy.myvpn.example.com"}, "8.8.8.8")
+	}
+}
+
+// TestPolicyDNSProfiles exercises the policy DNS profiles feature
+// end-to-end across two configurations and a hot-reload between them:
+//
+//	Phase 1 (default-only policy): the policy has a single default
+//	profile that sets split DNS for an internal domain. Both the admin
+//	and guest clients should receive that split DNS and nothing else
+//	(no Resolvers, no FallbackResolvers). This validates the default-
+//	profile catch-all path.
+//
+//	Phase 2 (hot reload → default + override): the policy is swapped
+//	in place to add a second profile that overrides Resolvers for
+//	group:admin. The filewatcher → SetPolicy path should propagate
+//	the new policy without restarting headscale.
+//
+//	Phase 3 (post-reload chain inheritance): admin's netmap should
+//	carry the override Resolvers AND the default profile's Routes
+//	(inherited via the base → default → matched chain). Guest's netmap
+//	should remain on the default profile alone, demonstrating that
+//	non-matched nodes keep the default after the reload.
+//
+// One scenario setup, three configurations validated: default-only,
+// the hot-reload mechanism, and the chained-inheritance result.
+func TestPolicyDNSProfiles(t *testing.T) {
+	IntegrationSkip(t)
+
+	const (
+		adminUser   = "admin-user"
+		guestUser   = "guest-user"
+		splitDomain = "internal.example"
+		splitNS     = "10.99.0.99"
+		overrideNS  = "10.99.0.42"
+		adminGroup  = "group:admin"
+	)
+
+	splitMap := map[string][]string{splitDomain: {splitNS}}
+
+	// Initial policy: just the default profile with split DNS. No
+	// override profile yet.
+	initialPolicy := &policyv2.Policy{
+		Groups: policyv2.Groups{
+			policyv2.Group(adminGroup): []policyv2.Username{
+				policyv2.Username(adminUser + "@"),
+			},
+		},
+		DNS: policyv2.PolicyDNS{
+			{Split: &splitMap},
+		},
+	}
+
+	spec := ScenarioSpec{
+		NodesPerUser: 1,
+		Users:        []string{adminUser, guestUser},
+		Versions:     []string{"head"},
+	}
+
+	scenario, err := NewScenario(spec)
+	require.NoError(t, err)
+	defer scenario.ShutdownAssertNoPanics(t)
+
+	err = scenario.CreateHeadscaleEnv(
+		[]tsic.Option{tsic.WithNetfilter("off")},
+		hsic.WithACLPolicy(initialPolicy),
+		hsic.WithTestName("dnsreload"),
+		hsic.WithConfigEnv(map[string]string{
+			"HEADSCALE_DNS_BASE_DOMAIN":        "",
+			"HEADSCALE_DNS_MAGIC_DNS":          "false",
+			"HEADSCALE_DNS_OVERRIDE_LOCAL_DNS": "false",
+			"HEADSCALE_DNS_NAMESERVERS_GLOBAL": "",
+			"HEADSCALE_MAGIC_DNS_ENABLED":      "true",
+			"HEADSCALE_MAGIC_DNS_BASE_DOMAIN":  "headscale.net",
+		}),
+	)
+	requireNoErrHeadscaleEnv(t, err)
+
+	err = scenario.WaitForTailscaleSync()
+	requireNoErrSync(t, err)
+
+	adminClients, err := scenario.ListTailscaleClients(adminUser)
+	requireNoErrListClients(t, err)
+	require.NotEmpty(t, adminClients)
+	guestClients, err := scenario.ListTailscaleClients(guestUser)
+	requireNoErrListClients(t, err)
+	require.NotEmpty(t, guestClients)
+
+	// Phase 1: under the initial policy, everyone (admin + guest) gets
+	// the default profile: split DNS, no Resolvers, no FallbackResolvers.
+	assertDefaultOnly := func(stage string) {
+		for _, client := range append(adminClients, guestClients...) {
+			assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+				nm, err := client.Netmap()
+				if !assert.NoError(ct, err) || !assert.NotNil(ct, nm) || !assert.NotNil(ct, nm.DNS) {
+					return
+				}
+				assert.Empty(ct, nm.DNS.Resolvers, "%s: %s should have no Resolvers under default-only policy", stage, client.Hostname())
+				assert.Empty(ct, nm.DNS.FallbackResolvers, "%s: %s should have no FallbackResolvers under default-only policy", stage, client.Hostname())
+				if assert.Contains(ct, nm.DNS.Routes, splitDomain, "%s: %s should receive Routes from the default profile", stage, client.Hostname()) {
+					assert.Len(ct, nm.DNS.Routes[splitDomain], 1)
+					assert.Equal(ct, splitNS, nm.DNS.Routes[splitDomain][0].Addr)
+				}
+			}, integrationutil.StatusReadyTimeout, 1*time.Second)
+		}
+	}
+	assertDefaultOnly("initial")
+
+	// Phase 2: hot-reload the policy to add a group:admin override.
+	overrideNSList := []string{overrideNS}
+	updatedPolicy := &policyv2.Policy{
+		Groups: initialPolicy.Groups,
+		DNS: policyv2.PolicyDNS{
+			{Split: &splitMap},
+			{
+				Nameservers:      &overrideNSList,
+				OverrideLocalDNS: true,
+				Groups:           []policyv2.Group{policyv2.Group(adminGroup)},
+			},
+		},
+	}
+
+	headscale, err := scenario.Headscale()
+	require.NoError(t, err)
+	require.NoError(t, headscale.SetPolicy(updatedPolicy),
+		"hot-reloading the policy should succeed (no cross-file conflict, no validation rejection)")
+
+	// Phase 3: admin now receives the override Resolvers + inherited Routes;
+	// guest still receives the default profile only. EventuallyWithT bounds
+	// the wait so the netmap update can propagate to the clients.
+	for _, client := range adminClients {
+		assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+			nm, err := client.Netmap()
+			if !assert.NoError(ct, err) || !assert.NotNil(ct, nm) || !assert.NotNil(ct, nm.DNS) {
+				return
+			}
+			if assert.Len(ct, nm.DNS.Resolvers, 1, "admin should have one Resolver after reload") {
+				assert.Equal(ct, overrideNS, nm.DNS.Resolvers[0].Addr,
+					"admin's Resolvers should be the override after reload")
+			}
+			assert.Empty(ct, nm.DNS.FallbackResolvers)
+			if assert.Contains(ct, nm.DNS.Routes, splitDomain,
+				"admin should still inherit Routes from the default profile") {
+				assert.Len(ct, nm.DNS.Routes[splitDomain], 1)
+				assert.Equal(ct, splitNS, nm.DNS.Routes[splitDomain][0].Addr)
+			}
+		}, integrationutil.PolicyPropagationTimeout, 2*time.Second,
+			"admin %s should receive override after hot-reload", client.Hostname())
+	}
+	for _, client := range guestClients {
+		assert.EventuallyWithT(t, func(ct *assert.CollectT) {
+			nm, err := client.Netmap()
+			if !assert.NoError(ct, err) || !assert.NotNil(ct, nm) || !assert.NotNil(ct, nm.DNS) {
+				return
+			}
+			assert.Empty(ct, nm.DNS.Resolvers, "guest should remain on default profile")
+			assert.Empty(ct, nm.DNS.FallbackResolvers)
+			assert.Contains(ct, nm.DNS.Routes, splitDomain)
+		}, integrationutil.PolicyPropagationTimeout, 2*time.Second,
+			"guest %s should remain on default after hot-reload", client.Hostname())
 	}
 }

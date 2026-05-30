@@ -11,6 +11,58 @@ to understand how the packet filter should be generated. We discovered a few dif
 overall our implementation was very close.
 [#3036](https://github.com/juanfont/headscale/pull/3036)
 
+### DNS profiles (per-tag / per-user / per-group) [#3012](https://github.com/juanfont/headscale/issues/3012)
+
+The policy file gains a top-level `dns` block: an ordered list of DNS
+profile alternatives that operators can assign to nodes by tag, user, or
+group. The first profile is the default. Subsequent profiles override
+the default for matching nodes.
+
+Each profile mirrors the shape of headscale.yaml's `dns` block —
+`nameservers`, `overrideLocalDNS`, `split`, `searchDomains` — plus
+optional assignment lists (`groups`, `users`, `tags`). Resolution walks
+profiles by tier (tag > user > group), and within each tier list order
+picks the winner. Tagged nodes consult only the tag tier; untagged
+nodes that match no tier fall through to the default profile.
+
+Profiles compose via a chain: `base → defaultProfile → matchedProfile`.
+Fields use present-vs-absent semantics — an absent field inherits from
+the previous layer; a present field (even if empty) replaces it.
+
+```hujson
+{
+  "groups": { "group:admin": ["alice@"], "group:guests": ["bob@"] },
+  "dns": [
+    {
+      // Default for everyone — split DNS for the internal domain.
+      "split": { "internal.example": ["10.0.0.1"] }
+    },
+    {
+      // Admins also override their primary resolver to AdGuard.
+      "nameservers": ["192.168.4.2"],
+      "overrideLocalDNS": true,
+      "groups": ["group:admin"]
+    }
+  ]
+}
+```
+
+DNS profile changes are hot-reloaded with the policy file.
+
+### `magic_dns` configuration block
+
+A new top-level `magic_dns:` block separates the tailnet-wide MagicDNS
+settings (`enabled`, `base_domain`, `extra_records`,
+`extra_records_path`) from the per-node DNS resolver configuration.
+The equivalent fields under the legacy `dns:` block continue to work
+for backwards compatibility but are deprecated (and log a warning on
+startup); they are forbidden when the new `magic_dns:` block is also
+set, since the two blocks are mutually exclusive.
+
+Configuring DNS in both headscale.yaml's `dns:` block AND the policy's
+`dns:` block at the same time is now rejected at startup — they are
+mutually exclusive, and the policy is the preferred location.
+
 ### SSH check action
 
 SSH rules with `"action": "check"` are now supported. When a client initiates a SSH connection to a node

@@ -24,6 +24,23 @@ type PolicyManager interface {
 	// SSHCheckParams resolves the SSH check period for a (src, dst) pair
 	// from the current policy, avoiding trust of client-provided URL params.
 	SSHCheckParams(srcNodeID, dstNodeID types.NodeID) (time.Duration, bool)
+	// NodeDNSConfig returns the DNSConfig for the given node. The policy's
+	// dns block is a list of profiles; the first profile that matches the
+	// node by tag, user, or group supplies the node's DNS config (with
+	// list-order precedence within each tier and tag > user > group across
+	// tiers). Untagged nodes that match no profile fall through to the
+	// first profile (the default). With no dns block at all in the policy,
+	// base is returned unchanged.
+	NodeDNSConfig(node types.NodeView, base *tailcfg.DNSConfig, baseDomain string) *tailcfg.DNSConfig
+	// HasDNSConfig reports whether the policy has a non-empty dns block.
+	// Used to enforce the cross-file invariant that DNS is configured in
+	// at most one of headscale.yaml or the policy file.
+	HasDNSConfig() bool
+	// SetYAMLDNSPresent records whether headscale.yaml's legacy dns block
+	// has any content. Set once at startup; consulted by SetPolicy on
+	// hot-reload to keep the cross-file invariant from being violated
+	// after server start.
+	SetYAMLDNSPresent(present bool)
 	SetPolicy(pol []byte) (bool, error)
 	SetUsers(users []types.User) (bool, error)
 	SetNodes(nodes views.Slice[types.NodeView]) (bool, error)

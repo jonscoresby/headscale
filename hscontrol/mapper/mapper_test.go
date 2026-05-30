@@ -17,6 +17,17 @@ var iap = func(ipStr string) *netip.Addr {
 	return &ip
 }
 
+// dnsConfigStaterStub satisfies [dnsConfigStater] for tests that do not
+// exercise per-group DNS overrides. It returns a clone of base unchanged.
+type dnsConfigStaterStub struct{}
+
+func (dnsConfigStaterStub) NodeDNSConfig(_ types.NodeView, base *tailcfg.DNSConfig) *tailcfg.DNSConfig {
+	if base == nil {
+		return nil
+	}
+	return base.Clone()
+}
+
 func TestDNSConfigMapResponse(t *testing.T) {
 	tests := []struct {
 		magicDNS bool
@@ -64,6 +75,7 @@ func TestDNSConfigMapResponse(t *testing.T) {
 			nodeInShared1 := mach("test_get_shared_nodes_1", "shared1", 1)
 
 			got := generateDNSConfig(
+				dnsConfigStaterStub{},
 				&types.Config{
 					TailcfgDNSConfig: &dnsConfigOrig,
 				},
@@ -124,6 +136,7 @@ func TestNextDNSCapMapRendering(t *testing.T) {
 		t.Parallel()
 
 		got := generateDNSConfig(
+			dnsConfigStaterStub{},
 			mkConfig("https://dns.nextdns.io/abc"),
 			mkNode(),
 			nil,
@@ -143,6 +156,7 @@ func TestNextDNSCapMapRendering(t *testing.T) {
 		}
 
 		got := generateDNSConfig(
+			dnsConfigStaterStub{},
 			mkConfig("https://dns.nextdns.io/global"),
 			mkNode(),
 			capMap,
@@ -163,6 +177,7 @@ func TestNextDNSCapMapRendering(t *testing.T) {
 		}
 
 		got := generateDNSConfig(
+			dnsConfigStaterStub{},
 			mkConfig("https://dns.nextdns.io/global"),
 			mkNode(),
 			capMap,
@@ -182,6 +197,7 @@ func TestNextDNSCapMapRendering(t *testing.T) {
 		}
 
 		got := generateDNSConfig(
+			dnsConfigStaterStub{},
 			mkConfig("https://dns.example.org/dns-query"),
 			mkNode(),
 			capMap,

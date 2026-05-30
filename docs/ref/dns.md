@@ -3,6 +3,12 @@
 Headscale supports [most DNS features](../about/features.md) from Tailscale. DNS related settings can be configured
 within the `dns` section of the [configuration file](configuration.md).
 
+For **per-node DNS configuration** (different resolvers, override flags,
+or split-DNS routes for different groups, users, or tagged nodes), see
+[DNS profiles in the policy file](policy.md#dns-profiles). The tailnet-wide
+MagicDNS settings (`base_domain`, `magic_dns: bool`, `extra_records`) stay
+in `headscale.yaml`; per-node DNS lives in the policy file.
+
 ## Setting extra DNS records
 
 Headscale allows to set extra DNS records which are made available via

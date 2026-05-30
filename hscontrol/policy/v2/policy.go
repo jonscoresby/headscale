@@ -19,6 +19,7 @@ import (
 	"go4.org/netipx"
 	"tailscale.com/net/tsaddr"
 	"tailscale.com/tailcfg"
+	"tailscale.com/types/dnstype"
 	"tailscale.com/types/views"
 	"tailscale.com/util/deephash"
 	"tailscale.com/util/multierr"
@@ -32,6 +33,23 @@ type PolicyManager struct {
 	pol   *Policy
 	users []types.User
 	nodes views.Slice[types.NodeView]
+
+	// yamlDNSPresent records whether headscale.yaml's legacy dns block
+	// has any content. Set once at startup (yaml changes require a
+	// restart) and consulted on SetPolicy so a hot-reload that would
+	// introduce a policy.dns block alongside an already-set yaml.dns
+	// block is rejected before mutating state.
+	yamlDNSPresent bool
+
+	// Precomputed DNS profile indexes used by matchProfile. Built once
+	// per policy/users reload from pol.DNS so the per-netmap-build
+	// lookup collapses from O(profiles × principals × users) nested
+	// scans to three map probes. Each map points at the lowest-index
+	// profile that lists the key; later occurrences are ignored
+	// (validation guarantees uniqueness across profiles anyway).
+	dnsTagToProfile   map[Tag]int
+	dnsUserToProfile  map[types.UserID]int
+	dnsGroupToProfile map[Group]int
 
 	filterHash deephash.Sum
 	filter     []tailcfg.FilterRule
@@ -222,6 +240,7 @@ func (pm *PolicyManager) updateLocked() (bool, error) {
 	// rules are derived from these compiled grants.
 	pm.compiledGrants = pm.pol.compileGrants(pm.users, pm.nodes)
 	pm.userNodeIdx = buildUserNodeIndex(pm.nodes)
+	pm.rebuildDNSProfileIndexes()
 	pm.needsPerNodeFilter = hasPerNodeGrants(pm.compiledGrants)
 
 	var filter []tailcfg.FilterRule
@@ -464,6 +483,244 @@ func (pm *PolicyManager) SSHCheckParams(
 	return 0, false
 }
 
+// NodeDNSConfig returns the DNSConfig that should be sent to the given
+// node, replacing the supplied policy-wide base with the DNS profile
+// chosen for the node from the policy's "dns" block. The lookup walks
+// profiles by tier — tag > user > group — and within each tier list
+// order picks the winner; if no tier matches, the default profile
+// (first in list) is used. A nil base produces a nil result.
+//
+// The effective DNSConfig is built by chaining the matched profile on
+// top of the default profile on top of the base — fields on a profile
+// that are present (even if empty) replace the chained value; absent
+// fields inherit from the prior layer.
+//
+// baseDomain is the operator-configured MagicDNS base domain (empty if
+// MagicDNS is not enabled). It is passed explicitly because base.Domains
+// is the wire-format slice `[base_domain, search1, search2, ...]` when
+// MagicDNS is enabled but `[search1, search2, ...]` when it is not, and
+// the SearchDomains profile field's "preserve base_domain, replace the
+// search portion" semantic needs to distinguish those two cases.
+func (pm *PolicyManager) NodeDNSConfig(node types.NodeView, base *tailcfg.DNSConfig, baseDomain string) *tailcfg.DNSConfig {
+	if base == nil {
+		return nil
+	}
+
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	if pm.pol == nil || len(pm.pol.DNS) == 0 {
+		return base.Clone()
+	}
+
+	matchIdx := pm.matchProfile(node)
+	// Apply chain: base → default → matched (skip second step if the
+	// matched profile IS the default).
+	cfg := applyDNSProfile(base, pm.pol.DNS[0], baseDomain)
+	if matchIdx > 0 {
+		cfg = applyDNSProfile(cfg, pm.pol.DNS[matchIdx], baseDomain)
+	}
+	return cfg
+}
+
+// matchProfile returns the index of the profile chosen for the given
+// node. Returns 0 (the default) when no tier matches — including for
+// tagged nodes whose tags are not assigned to any profile. Caller must
+// hold pm.mu.
+//
+// The precomputed dnsTagToProfile / dnsUserToProfile / dnsGroupToProfile
+// indexes (rebuilt by [PolicyManager.rebuildDNSProfileIndexes] on
+// policy/users reload) reduce this to a small number of map probes
+// rather than nested scans across profiles × principals × users.
+func (pm *PolicyManager) matchProfile(node types.NodeView) int {
+	// Tag tier: tagged nodes consult only the tag tier.
+	if node.IsTagged() {
+		best := -1
+		for _, tagStr := range node.Tags().AsSlice() {
+			if idx, ok := pm.dnsTagToProfile[Tag(tagStr)]; ok {
+				if best == -1 || idx < best {
+					best = idx
+				}
+			}
+		}
+		if best == -1 {
+			return 0
+		}
+		return best
+	}
+
+	if !node.User().Valid() {
+		return 0
+	}
+	nodeUserID := types.UserID(node.User().ID())
+
+	// User tier.
+	if idx, ok := pm.dnsUserToProfile[nodeUserID]; ok {
+		return idx
+	}
+
+	// Group tier: walk the node's user's group memberships, taking the
+	// lowest-indexed profile across all groups the user is in.
+	best := -1
+	for groupName, members := range pm.pol.Groups {
+		idx, ok := pm.dnsGroupToProfile[groupName]
+		if !ok {
+			continue
+		}
+		if best != -1 && idx >= best {
+			continue
+		}
+		for _, member := range members {
+			user, err := member.resolveUser(pm.users)
+			if err != nil {
+				continue
+			}
+			if types.UserID(user.ID) == nodeUserID {
+				best = idx
+				break
+			}
+		}
+	}
+	if best == -1 {
+		return 0
+	}
+	return best
+}
+
+// rebuildDNSProfileIndexes recomputes dnsTagToProfile, dnsUserToProfile,
+// dnsGroupToProfile from the current pol.DNS + users. Called from
+// [PolicyManager.updateLocked] (on policy/nodes reload) and after
+// SetUsers, since user-tier resolution depends on username → user.ID
+// lookups.
+//
+// Each map stores the lowest-indexed profile that lists the key.
+// Validation guarantees each principal appears in at most one profile,
+// so for correctly-validated policies there are no ties; the
+// "lowest-index wins" rule is for defensive handling of pre-validation
+// pathological inputs. Caller must hold pm.mu.
+func (pm *PolicyManager) rebuildDNSProfileIndexes() {
+	pm.dnsTagToProfile = nil
+	pm.dnsUserToProfile = nil
+	pm.dnsGroupToProfile = nil
+	if pm.pol == nil || len(pm.pol.DNS) == 0 {
+		return
+	}
+
+	pm.dnsTagToProfile = make(map[Tag]int)
+	pm.dnsUserToProfile = make(map[types.UserID]int)
+	pm.dnsGroupToProfile = make(map[Group]int)
+
+	for i, profile := range pm.pol.DNS {
+		for _, t := range profile.Tags {
+			if _, dup := pm.dnsTagToProfile[t]; !dup {
+				pm.dnsTagToProfile[t] = i
+			}
+		}
+		for _, u := range profile.Users {
+			user, err := u.resolveUser(pm.users)
+			if err != nil {
+				continue
+			}
+			id := types.UserID(user.ID)
+			if _, dup := pm.dnsUserToProfile[id]; !dup {
+				pm.dnsUserToProfile[id] = i
+			}
+		}
+		for _, g := range profile.Groups {
+			if _, dup := pm.dnsGroupToProfile[g]; !dup {
+				pm.dnsGroupToProfile[g] = i
+			}
+		}
+	}
+}
+
+// HasDNSConfig reports whether the policy has a non-empty dns block.
+// Used to enforce the cross-file invariant that DNS is configured in at
+// most one of headscale.yaml or the policy file.
+func (pm *PolicyManager) HasDNSConfig() bool {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	return pm.pol != nil && len(pm.pol.DNS) > 0
+}
+
+// SetYAMLDNSPresent records whether headscale.yaml's legacy dns block
+// has any content. Called once at startup; consulted by SetPolicy so a
+// hot-reload that would introduce a policy.dns block while yaml.dns is
+// also set is rejected without mutating the in-memory policy.
+func (pm *PolicyManager) SetYAMLDNSPresent(present bool) {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	pm.yamlDNSPresent = present
+}
+
+// applyDNSProfile returns a clone of base with the profile's fields
+// substituted in. Pointer-typed fields use present-vs-absent semantics:
+// a present field (even if empty) replaces the corresponding value on
+// base; an absent field inherits.
+//
+//   - Nameservers: when present, replaces Resolvers (if OverrideLocalDNS
+//     is true) or FallbackResolvers (if false). The unused field is
+//     cleared so the profile fully determines the resolver state. When
+//     absent, both Resolvers and FallbackResolvers are inherited from
+//     base and OverrideLocalDNS is ignored.
+//   - Split: when present, replaces Routes entirely. When absent,
+//     base.Routes is inherited.
+//   - SearchDomains: when present, replaces the search-domain portion of
+//     Domains while preserving the MagicDNS base_domain (`Domains[0]`
+//     iff baseDomain != ""). When baseDomain is empty, `base.Domains`
+//     is entirely search domains, so SearchDomains replaces the whole
+//     slice. When absent, base.Domains is inherited unchanged.
+//
+// All other DNSConfig fields are inherited from base.
+func applyDNSProfile(base *tailcfg.DNSConfig, profile DNSProfile, baseDomain string) *tailcfg.DNSConfig {
+	cfg := base.Clone()
+	if profile.Nameservers != nil {
+		resolvers := stringsToResolvers(*profile.Nameservers)
+		if profile.OverrideLocalDNS {
+			cfg.Resolvers = resolvers
+			cfg.FallbackResolvers = nil
+		} else {
+			cfg.FallbackResolvers = resolvers
+			cfg.Resolvers = nil
+		}
+	}
+	if profile.Split != nil {
+		cfg.Routes = make(map[string][]*dnstype.Resolver, len(*profile.Split))
+		for domain, addrs := range *profile.Split {
+			cfg.Routes[domain] = stringsToResolvers(addrs)
+		}
+	}
+	if profile.SearchDomains != nil {
+		// Preserve the MagicDNS base_domain (Domains[0] in the wire
+		// format) only if MagicDNS is actually configured. When
+		// baseDomain is empty, base.Domains is all search suffixes and
+		// the profile's SearchDomains replaces the whole list.
+		var preserved []string
+		if baseDomain != "" && len(cfg.Domains) > 0 && cfg.Domains[0] == baseDomain {
+			preserved = []string{cfg.Domains[0]}
+		}
+		cfg.Domains = append(preserved, (*profile.SearchDomains)...)
+	}
+	return cfg
+}
+
+// stringsToResolvers converts a list of address strings (IPs or DoH URLs)
+// into the wire-protocol resolver slice. Mirrors the leniency of
+// (*types.DNSConfig).globalResolvers: invalid entries are not rejected
+// here but simply will not resolve at runtime.
+func stringsToResolvers(addrs []string) []*dnstype.Resolver {
+	if len(addrs) == 0 {
+		return nil
+	}
+
+	resolvers := make([]*dnstype.Resolver, 0, len(addrs))
+	for _, a := range addrs {
+		resolvers = append(resolvers, &dnstype.Resolver{Addr: a})
+	}
+
+	return resolvers
+}
+
 func (pm *PolicyManager) SetPolicy(polB []byte) (bool, error) {
 	if len(polB) == 0 {
 		return false, nil
@@ -476,6 +733,18 @@ func (pm *PolicyManager) SetPolicy(polB []byte) (bool, error) {
 
 	pm.mu.Lock()
 	defer pm.mu.Unlock()
+
+	// Cross-file consistency: reject a hot-reload that would introduce a
+	// policy.dns block alongside an already-set headscale.yaml dns block.
+	// This is the same invariant enforced at server startup in
+	// [state.NewState]; we re-check here so an operator who edits the
+	// policy file while running can't silently end up with two DNS sources.
+	if len(pol.DNS) > 0 && pm.yamlDNSPresent {
+		return false, fmt.Errorf(
+			"policy.dns conflicts with headscale.yaml's legacy `dns:` " +
+				"block; remove one (the policy dns block is the preferred " +
+				"location)")
+	}
 
 	err = validateUserReferences(pol, pm.users)
 	if err != nil {

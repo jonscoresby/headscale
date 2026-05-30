@@ -130,7 +130,21 @@ const (
 // or `..` into the resolver URL via a crafted cap name.
 var nextDNSProfileRE = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 
+// dnsConfigStater is the subset of [*state.State] that generateDNSConfig
+// depends on. Defined as an interface to keep the surface area narrow and to
+// ease testing without instantiating the full State.
+type dnsConfigStater interface {
+	NodeDNSConfig(node types.NodeView, base *tailcfg.DNSConfig) *tailcfg.DNSConfig
+}
+
+// generateDNSConfig produces the DNSConfig for the given node by
+// applying its matched policy DNS profile (if any) on top of the
+// policy-wide base (cfg.TailcfgDNSConfig). NextDNS profile rewriting
+// and metadata are then applied to the resulting resolvers so per-device
+// identification continues to work for nodes that inherit a NextDNS
+// resolver.
 func generateDNSConfig(
+	s dnsConfigStater,
 	cfg *types.Config,
 	node types.NodeView,
 	capMap tailcfg.NodeCapMap,
@@ -139,7 +153,10 @@ func generateDNSConfig(
 		return nil
 	}
 
-	dnsConfig := cfg.TailcfgDNSConfig.Clone()
+	dnsConfig := s.NodeDNSConfig(node, cfg.TailcfgDNSConfig)
+	if dnsConfig == nil {
+		return nil
+	}
 
 	profile := nextDNSProfileFromCapMap(capMap)
 	if profile != "" {

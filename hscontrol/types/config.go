@@ -123,6 +123,20 @@ type Config struct {
 	// not directly converted into a [tailcfg.DNSConfig].
 	DNSConfig DNSConfig
 
+	// MagicDNSConfig holds the tailnet-wide MagicDNS settings
+	// (enabled flag, base domain, extra DNS records). When set, the
+	// equivalent fields under the legacy DNSConfig block are forbidden.
+	// See [MagicDNSConfig] for the migration story.
+	MagicDNSConfig MagicDNSConfig
+
+	// DNSPresence records which legacy `dns:` and new `magic_dns:` keys
+	// the operator actually set (via the yaml file or env vars), as
+	// opposed to values that came from viper's SetDefault calls. The
+	// cross-file invariants (policy.dns vs yaml.dns, magic_dns vs
+	// legacy dns) consult this to distinguish "operator wrote it" from
+	// "default value of true." See [DNSPresence] and [operatorSetKey].
+	DNSPresence DNSPresence
+
 	// TailcfgDNSConfig is the tailcfg representation of the DNS configuration,
 	// it can be used directly when sending Netmaps to clients.
 	TailcfgDNSConfig *tailcfg.DNSConfig
@@ -149,6 +163,99 @@ type DNSConfig struct {
 	OverrideLocalDNS bool   `mapstructure:"override_local_dns"`
 	Nameservers      Nameservers
 	SearchDomains    []string            `mapstructure:"search_domains"`
+	ExtraRecords     []tailcfg.DNSRecord `mapstructure:"extra_records"`
+	ExtraRecordsPath string              `mapstructure:"extra_records_path"`
+}
+
+// DNSPresence records which DNS-related config keys the operator
+// actually set (via the yaml file or env vars). It is populated at
+// config load time using [operatorSetKey], not derived from
+// [DNSConfig] / [MagicDNSConfig] values, because viper's SetDefault
+// causes value-based checks to report `true` for fields the operator
+// never wrote — that would unconditionally trip the cross-file
+// invariants on every default install.
+type DNSPresence struct {
+	// LegacyDNSBlockPresent is true if the operator set any key under
+	// the legacy `dns:` block. Used for the policy.dns vs yaml.dns
+	// mutual-exclusion check.
+	LegacyDNSBlockPresent bool
+	// LegacyDNSMagicFieldsPresent is true if the operator set any of
+	// the MagicDNS-related keys under the legacy `dns:` block
+	// (magic_dns, base_domain, extra_records, extra_records_path).
+	// Used for the magic_dns vs legacy dns mutual-exclusion check.
+	LegacyDNSMagicFieldsPresent bool
+	// MagicDNSBlockPresent is true if the operator set any key under
+	// the new `magic_dns:` block.
+	MagicDNSBlockPresent bool
+}
+
+// operatorSetKey reports whether the operator actually configured a
+// given viper key — either by writing it in the yaml config file or by
+// setting the corresponding HEADSCALE_* env var. Unlike viper.IsSet,
+// this does NOT return true for keys whose only source is a SetDefault
+// call: viper.InConfig is consulted instead of viper.IsSet, and env
+// vars are checked directly via the same naming convention
+// (HEADSCALE_<KEY_WITH_DOTS_AS_UNDERSCORES>).
+func operatorSetKey(key string) bool {
+	if viper.InConfig(key) {
+		return true
+	}
+	envKey := "HEADSCALE_" + strings.ReplaceAll(strings.ToUpper(key), ".", "_")
+	_, ok := os.LookupEnv(envKey)
+	return ok
+}
+
+// loadDNSPresence inspects the operator's config (yaml + env) and
+// populates a [DNSPresence] snapshot for use in cross-file invariant
+// checks. Called once at startup from [LoadServerConfig].
+func loadDNSPresence() DNSPresence {
+	legacyDNSKeys := []string{
+		"dns.magic_dns",
+		"dns.base_domain",
+		"dns.override_local_dns",
+		"dns.nameservers.global",
+		"dns.nameservers.split",
+		"dns.search_domains",
+		"dns.extra_records",
+		"dns.extra_records_path",
+	}
+	legacyDNSMagicKeys := []string{
+		"dns.magic_dns",
+		"dns.base_domain",
+		"dns.extra_records",
+		"dns.extra_records_path",
+	}
+	magicDNSKeys := []string{
+		"magic_dns.enabled",
+		"magic_dns.base_domain",
+		"magic_dns.extra_records",
+		"magic_dns.extra_records_path",
+	}
+
+	any := func(keys []string) bool {
+		for _, k := range keys {
+			if operatorSetKey(k) {
+				return true
+			}
+		}
+		return false
+	}
+
+	return DNSPresence{
+		LegacyDNSBlockPresent:       any(legacyDNSKeys),
+		LegacyDNSMagicFieldsPresent: any(legacyDNSMagicKeys),
+		MagicDNSBlockPresent:        any(magicDNSKeys),
+	}
+}
+
+// MagicDNSConfig holds the tailnet-wide MagicDNS settings. These are
+// always server-level (cannot be expressed per-node) so they live in
+// headscale.yaml, not in the policy file. When this block is set, the
+// equivalent fields under the legacy dns block (magic_dns, base_domain,
+// extra_records, extra_records_path) are forbidden.
+type MagicDNSConfig struct {
+	Enabled          bool                `mapstructure:"enabled"`
+	BaseDomain       string              `mapstructure:"base_domain"`
 	ExtraRecords     []tailcfg.DNSRecord `mapstructure:"extra_records"`
 	ExtraRecordsPath string              `mapstructure:"extra_records_path"`
 }
@@ -955,27 +1062,76 @@ func (d *DNSConfig) splitResolvers() map[string][]*dnstype.Resolver {
 	return routes
 }
 
-func dnsToTailcfgDNS(dns DNSConfig) *tailcfg.DNSConfig {
-	cfg := tailcfg.DNSConfig{}
+// magicDNS loads the new magic_dns block from viper. Returns a
+// MagicDNSConfig (potentially empty if no magic_dns block is configured).
+func magicDNS() (MagicDNSConfig, error) {
+	var m MagicDNSConfig
 
-	if dns.BaseDomain == "" && dns.MagicDNS {
-		log.Fatal().Msg("dns.base_domain must be set when using MagicDNS (dns.magic_dns)")
+	// Mirror the legacy dns block's parity check: extra_records and
+	// extra_records_path are mutually exclusive, since one is an inline
+	// list and the other is a file-watched path to the same content.
+	if viper.IsSet("magic_dns.extra_records") && viper.IsSet("magic_dns.extra_records_path") {
+		return m, fmt.Errorf(
+			"magic_dns.extra_records and magic_dns.extra_records_path are " +
+				"mutually exclusive; remove one of them from your config file")
 	}
 
-	cfg.Proxied = dns.MagicDNS
+	m.Enabled = viper.GetBool("magic_dns.enabled")
+	m.BaseDomain = viper.GetString("magic_dns.base_domain")
+	m.ExtraRecordsPath = viper.GetString("magic_dns.extra_records_path")
+	if viper.IsSet("magic_dns.extra_records") {
+		var extraRecords []tailcfg.DNSRecord
+		if err := viper.UnmarshalKey("magic_dns.extra_records", &extraRecords); err != nil {
+			return m, fmt.Errorf("unmarshalling magic_dns.extra_records: %w", err)
+		}
+		m.ExtraRecords = extraRecords
+	}
+	return m, nil
+}
 
-	cfg.ExtraRecords = dns.ExtraRecords
+// effectiveMagicDNS returns the MagicDNS settings that should be applied.
+// The new magic_dns block and the legacy MagicDNS fields under dns are
+// mutually exclusive (enforced at config load); whichever block the
+// operator actually set is the source of truth.
+//
+// Presence is determined via [DNSPresence.MagicDNSBlockPresent] rather
+// than a value check on the MagicDNSConfig, so an explicit
+// `magic_dns.enabled: false` is honored (otherwise the value-only
+// check would treat all-zero-but-set magic_dns as "not present" and
+// fall back to the legacy block).
+func effectiveMagicDNS(dns DNSConfig, m MagicDNSConfig, magicDNSBlockPresent bool) MagicDNSConfig {
+	if magicDNSBlockPresent {
+		return m
+	}
+	return MagicDNSConfig{
+		Enabled:          dns.MagicDNS,
+		BaseDomain:       dns.BaseDomain,
+		ExtraRecords:     dns.ExtraRecords,
+		ExtraRecordsPath: dns.ExtraRecordsPath,
+	}
+}
+
+func dnsToTailcfgDNS(dns DNSConfig, magic MagicDNSConfig, magicDNSBlockPresent bool) *tailcfg.DNSConfig {
+	cfg := tailcfg.DNSConfig{}
+
+	eff := effectiveMagicDNS(dns, magic, magicDNSBlockPresent)
+
+	if eff.BaseDomain == "" && eff.Enabled {
+		log.Fatal().Msg("base_domain must be set when using MagicDNS")
+	}
+
+	cfg.Proxied = eff.Enabled
+	cfg.ExtraRecords = eff.ExtraRecords
+
 	if dns.OverrideLocalDNS {
 		cfg.Resolvers = dns.globalResolvers()
 	} else {
 		cfg.FallbackResolvers = dns.globalResolvers()
 	}
 
-	routes := dns.splitResolvers()
-
-	cfg.Routes = routes
-	if dns.BaseDomain != "" {
-		cfg.Domains = []string{dns.BaseDomain}
+	cfg.Routes = dns.splitResolvers()
+	if eff.BaseDomain != "" {
+		cfg.Domains = []string{eff.BaseDomain}
 	}
 
 	cfg.Domains = append(cfg.Domains, dns.SearchDomains...)
@@ -1169,6 +1325,38 @@ func LoadServerConfig() (*Config, error) {
 		return nil, err
 	}
 
+	magicDNSConfig, err := magicDNS()
+	if err != nil {
+		return nil, err
+	}
+
+	// Snapshot which DNS-related config keys the operator actually set.
+	// We use viper.InConfig + env-var checks rather than value checks
+	// because viper.SetDefault makes value checks report `true` for
+	// fields the operator never wrote (e.g., `dns.magic_dns` defaults
+	// to true), which would unconditionally trip the cross-file
+	// invariants on every default install.
+	dnsPresence := loadDNSPresence()
+
+	// The new `magic_dns:` block and the legacy MagicDNS fields under
+	// `dns:` (magic_dns, base_domain, extra_records, extra_records_path)
+	// are mutually exclusive. The legacy fields continue to work for
+	// backwards compatibility but are deprecated; new configurations
+	// should use the top-level `magic_dns:` block.
+	if dnsPresence.MagicDNSBlockPresent && dnsPresence.LegacyDNSMagicFieldsPresent {
+		return nil, fmt.Errorf(
+			"MagicDNS settings configured in both the new `magic_dns:` " +
+				"block and the legacy `dns:` block (magic_dns / base_domain " +
+				"/ extra_records / extra_records_path); move them all under " +
+				"`magic_dns:` and remove from `dns:`")
+	}
+	if dnsPresence.LegacyDNSMagicFieldsPresent {
+		log.Warn().Msg(
+			"the MagicDNS-related fields under `dns:` (magic_dns, " +
+				"base_domain, extra_records, extra_records_path) are " +
+				"deprecated; move them to the top-level `magic_dns:` block")
+	}
+
 	derpConfig := derpConfig()
 	logTailConfig := logtailConfig()
 
@@ -1190,6 +1378,8 @@ func LoadServerConfig() (*Config, error) {
 
 	serverURL := viper.GetString("server_url")
 
+	effectiveBaseDomain := effectiveMagicDNS(dnsConfig, magicDNSConfig, dnsPresence.MagicDNSBlockPresent).BaseDomain
+
 	// BaseDomain cannot be the same as the server URL.
 	// This is because Tailscale takes over the domain in BaseDomain,
 	// causing the headscale server and DERP to be unreachable.
@@ -1197,8 +1387,8 @@ func LoadServerConfig() (*Config, error) {
 	// - DERP run on their own domains
 	// - Control plane runs on login.tailscale.com/controlplane.tailscale.com
 	// - MagicDNS (BaseDomain) for users is on a *.ts.net domain per tailnet (e.g. tail-scale.ts.net)
-	if dnsConfig.BaseDomain != "" {
-		err := isSafeServerURL(serverURL, dnsConfig.BaseDomain)
+	if effectiveBaseDomain != "" {
+		err := isSafeServerURL(serverURL, effectiveBaseDomain)
 		if err != nil {
 			return nil, err
 		}
@@ -1220,7 +1410,7 @@ func LoadServerConfig() (*Config, error) {
 		NoisePrivateKeyPath: util.AbsolutePathFromConfigPath(
 			viper.GetString("noise.private_key_path"),
 		),
-		BaseDomain: dnsConfig.BaseDomain,
+		BaseDomain: effectiveBaseDomain,
 
 		DERP: derpConfig,
 
@@ -1242,7 +1432,9 @@ func LoadServerConfig() (*Config, error) {
 		TLS: tlsConfig(),
 
 		DNSConfig:        dnsConfig,
-		TailcfgDNSConfig: dnsToTailcfgDNS(dnsConfig),
+		MagicDNSConfig:   magicDNSConfig,
+		DNSPresence:      dnsPresence,
+		TailcfgDNSConfig: dnsToTailcfgDNS(dnsConfig, magicDNSConfig, dnsPresence.MagicDNSBlockPresent),
 
 		ACMEEmail: viper.GetString("acme_email"),
 		ACMEURL:   viper.GetString("acme_url"),

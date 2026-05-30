@@ -226,6 +226,129 @@ configuration and attributes. At least the following node attributes are current
 }
 ```
 
+## DNS profiles
+
+The top-level `dns` block in the policy file is an ordered list of DNS
+profile alternatives that operators can assign to nodes by tag, user, or
+group. Profiles are the preferred location for per-node DNS
+configuration; the legacy `dns:` block in `headscale.yaml` is forbidden
+when policy DNS is in use.
+
+### Profile shape
+
+Each profile entry has these optional fields:
+
+| Field | Type | Effect on the wire `DNSConfig` |
+|---|---|---|
+| `nameservers` | `[]string` | When present and `overrideLocalDNS: true`, populates `Resolvers`. When present and `overrideLocalDNS: false`, populates `FallbackResolvers`. When absent, both are inherited from the previous layer. |
+| `overrideLocalDNS` | `bool` | Decides which wire field `nameservers` populates. Ignored when `nameservers` is absent. |
+| `split` | `map[string][]string` | Per-domain restricted resolvers (`Routes`). Replaces the previous layer's `Routes` when present; inherits when absent. |
+| `searchDomains` | `[]string` | DNS search suffixes. Appended after the `base_domain` in `Domains` when present; inherits when absent. |
+| `groups` | `[]Group` | Assignment list — nodes whose user is a member of any listed group match this profile via the group tier. |
+| `users` | `[]Username` | Assignment list — nodes whose user matches any listed username match this profile via the user tier. |
+| `tags` | `[]Tag` | Assignment list — tagged nodes match this profile via the tag tier. |
+
+### Resolution model
+
+For each node, the lookup walks profiles by tier in this order:
+
+1. **Tag tier** (most specific) — first profile whose `tags` list
+   contains a tag the node has. Tagged nodes consult ONLY the tag tier.
+2. **User tier** — first profile whose `users` list contains the node's
+   user.
+3. **Group tier** (least specific) — first profile whose `groups` list
+   contains a group the node's user is a member of.
+4. **Default** — the first profile in the list. Untagged nodes with no
+   tier match fall through to the default. Tagged-no-match nodes also
+   fall through to the default.
+
+Within each tier, **profile-list order** picks the winner — across all
+three tiers. A node in two groups assigned to different profiles gets
+the profile listed first; a tagged node carrying multiple tags assigned
+to different profiles also gets the profile listed first (the order of
+tags on the node itself is irrelevant).
+
+### Inheritance chain
+
+The wire `DNSConfig` sent to a node is built by chaining:
+
+```
+base  →  defaultProfile (always)  →  matchedProfile (if matched ≠ default)
+```
+
+Field semantics for each step of the chain:
+
+- **Absent field** (omitted in JSON) — inherits from the previous layer.
+- **Present field** (declared, even if empty) — replaces the previous
+  layer.
+
+Example:
+
+```hujson
+{
+  "groups": {
+    "group:admin": ["alice@"],
+    "group:guests": ["bob@"]
+  },
+  "dns": [
+    {
+      // Default for everyone. Split DNS for internal lookups.
+      "split": { "internal.example": ["10.0.0.1"] }
+    },
+    {
+      // Admins additionally override their primary resolver.
+      // Admins INHERIT the split DNS from the default profile.
+      "nameservers": ["192.168.4.2"],
+      "overrideLocalDNS": true,
+      "groups": ["group:admin"]
+    }
+  ]
+}
+```
+
+Result on the wire:
+
+| User | Resolvers | FallbackResolvers | Routes |
+|---|---|---|---|
+| `alice@` (admin) | `[192.168.4.2]` | `null` | `{"internal.example": ["10.0.0.1"]}` |
+| `bob@` (guest) | `null` | `null` | `{"internal.example": ["10.0.0.1"]}` |
+
+### Exemption mechanism
+
+A user listed on the **default profile's** `users` list overrides any
+later profile's `groups` assignment for that user, because the user tier
+beats the group tier across profiles. This lets operators exempt
+specific users from group-level DNS assignments without restructuring
+groups.
+
+The default profile may not have a `groups` list (it would be redundant
+since the default already catches all unmatched groups).
+
+### Validation
+
+The policy validator rejects:
+
+- A `groups` field on the default profile (index 0).
+- Any group, user, or tag appearing in more than one profile's
+  assignment list (each principal is assigned to at most one profile).
+- References to groups not defined in the policy's top-level `groups`
+  map, or tags not defined in `tagOwners`.
+- Malformed usernames (must contain `@`).
+
+### Cross-file invariants
+
+DNS configuration is mutually exclusive between the policy file's `dns`
+block and `headscale.yaml`'s legacy `dns:` block — headscale refuses to
+start if both are set. The tailnet-wide `magic_dns:` block in
+`headscale.yaml` (`enabled`, `base_domain`, `extra_records`,
+`extra_records_path`) is independent and always allowed.
+
+### Hot-reload
+
+Policy DNS changes take effect on policy reload (no headscale restart
+required). Changes to `magic_dns:` in `headscale.yaml` require a
+restart.
+
 ## Network-wide policy options
 
 The following options are applied for the entire tailnet. Consider [node attributes](#node-attributes) for a more

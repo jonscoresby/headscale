@@ -318,6 +318,34 @@ policy:
 #
 # If you want stop Headscale from managing the DNS configuration
 # all the fields under `dns` should be set to empty values.
+#
+# ---
+# Note on configuration layout
+# ---
+# DNS configuration is gradually moving toward two complementary blocks:
+#
+#   1. `magic_dns:` (this file) — tailnet-wide MagicDNS settings:
+#      `enabled`, `base_domain`, `extra_records`, `extra_records_path`.
+#   2. The policy file's top-level `dns:` block — per-node DNS
+#      configuration via DNS profiles, assigned by group / user / tag.
+#      See https://headscale.net/stable/ref/policy/#dns-profiles
+#
+# The legacy `dns:` block in this file continues to work for backwards
+# compatibility but is deprecated for the MagicDNS-related fields; those
+# should be moved to the `magic_dns:` block. The legacy block is
+# forbidden if the policy file's `dns:` block is configured (they are
+# mutually exclusive — the policy block supersedes the legacy block for
+# per-node DNS configuration).
+
+# Tailnet-wide MagicDNS configuration. Each field falls back to the
+# equivalent legacy `dns:` field if unset, so operators can migrate one
+# field at a time.
+# magic_dns:
+#   enabled: true
+#   base_domain: example.com
+#   extra_records: []
+#   # extra_records_path: /var/lib/headscale/extra-records.json
+
 dns:
   # Whether to use MagicDNS
   magic_dns: true

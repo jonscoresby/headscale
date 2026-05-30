@@ -36,6 +36,16 @@ var ErrAutogroupSelfRequiresPerNodeResolution = errors.New("autogroup:self requi
 
 var ErrUndefinedTagReference = errors.New("references undefined tag")
 
+// DNS validation errors.
+var (
+	ErrDNSDefaultProfileHasGroups = errors.New(
+		"default profile may not have a Groups list")
+	ErrDNSPrincipalAssignedTwice = errors.New(
+		"principal assigned to multiple DNS profiles")
+	ErrDNSProfileHasNoBody = errors.New(
+		"non-default profile has no DNS body fields (nameservers / split / searchDomains)")
+)
+
 // SSH validation errors.
 var (
 	ErrSSHTagSourceToUserDest             = errors.New("tags in SSH source cannot access user-owned devices")
@@ -2097,6 +2107,64 @@ type Policy struct {
 	Tests               []PolicyTest       `json:"tests,omitempty"`
 	SSHTests            []SSHPolicyTest    `json:"sshTests,omitempty"`
 	RandomizeClientPort bool               `json:"randomizeClientPort,omitempty"`
+	DNS                 PolicyDNS          `json:"dns,omitempty"`
+}
+
+// PolicyDNS is an ordered list of DNS profiles. The first profile is the
+// default — it applies to nodes that match no other profile's assignment
+// lists. Subsequent profiles override the default for nodes whose
+// identity (tag, user, or group membership) matches one of their
+// assignment lists.
+//
+// For each node the lookup walks all profiles by tier in this order:
+//
+//  1. Tag tier: first profile whose Tags list contains a tag the node has
+//  2. User tier: first profile whose Users list contains the node's user
+//  3. Group tier: first profile whose Groups list contains a group the
+//     node's user is a member of
+//  4. Default: the first profile in the list
+//
+// Within a tier, list order picks the winner — so an operator who needs
+// "this group of users gets profile A, that group gets profile B even
+// though some users are in both" puts profile A first.
+//
+// The matched profile is layered on top of the default profile on top
+// of the policy-wide base via [applyDNSProfile]: a field present on a
+// profile (even if empty) replaces the inherited value; an absent
+// field carries through from the layer below. A nil base produces a
+// nil result.
+type PolicyDNS []DNSProfile
+
+// DNSProfile is one DNS configuration that may be assigned to nodes by
+// tag, user, or group. The configuration fields mirror the shape of the
+// global headscale.yaml dns block: a list of nameservers, an
+// override-local-DNS flag, optional split-DNS routes, and optional DNS
+// search domains.
+//
+// Fields are pointer-typed where inherit-vs-replace matters so the
+// schema can distinguish "field absent" (inherit from the prior profile
+// in the chain) from "field present, even if empty" (replace with the
+// given value). Lookup produces the effective wire DNSConfig by chaining
+// the matched profile on top of the default profile on top of the
+// policy-wide base.
+//
+// The Groups, Users, and Tags fields are the profile's assignment lists.
+// A user, group, or tag may appear in at most one profile (validation
+// enforces this); a profile may have any combination of assignment lists
+// or none. The default profile (first in the list) is the only profile
+// that may not have a Groups list, since the default already covers all
+// groups by being the catch-all; Users and Tags on the default are
+// allowed as an exemption mechanism (a member of an assigned group can
+// be exempted by being listed on the default profile's Users).
+type DNSProfile struct {
+	Nameservers      *[]string            `json:"nameservers,omitempty"`
+	OverrideLocalDNS bool                 `json:"overrideLocalDNS,omitempty"`
+	Split            *map[string][]string `json:"split,omitempty"`
+	SearchDomains    *[]string            `json:"searchDomains,omitempty"`
+
+	Groups []Group    `json:"groups,omitempty"`
+	Users  []Username `json:"users,omitempty"`
+	Tags   []Tag      `json:"tags,omitempty"`
 }
 
 // MarshalJSON is deliberately not implemented for [Policy].
@@ -2905,6 +2973,83 @@ func (p *Policy) validate() error {
 
 	if err := validateSSHTests(p, p.SSHTests); err != nil { //nolint:noinlineerr
 		errs = append(errs, err)
+	}
+
+	// dns: validate the profile list. Rules:
+	//   - Every Groups entry must reference a defined group; every Tags
+	//     entry must be a defined tagOwner; every Users entry must be a
+	//     valid username (contains @).
+	//   - No group / user / tag appears in more than one profile's
+	//     assignment list (so a principal is assigned to at most one
+	//     profile; list-order precedence within a tier still applies for
+	//     ties caused by group membership at lookup time).
+	//   - The default profile (index 0) may not have a Groups list —
+	//     groups on the default are redundant (every group already falls
+	//     through to the default by being the catch-all). Users and Tags
+	//     are allowed on the default for the exemption mechanism.
+	for i, profile := range p.DNS {
+		if i == 0 && len(profile.Groups) > 0 {
+			errs = append(errs, ErrDNSDefaultProfileHasGroups)
+		}
+		// A non-default profile must define at least one DNS body field
+		// — otherwise it is a no-op against the default (the operator
+		// almost certainly forgot to add nameservers / split /
+		// searchDomains). The default profile is exempt: an empty
+		// default just means "no DNS overrides at all."
+		if i > 0 && profile.Nameservers == nil && profile.Split == nil && profile.SearchDomains == nil {
+			errs = append(errs, fmt.Errorf("dns[%d]: %w", i, ErrDNSProfileHasNoBody))
+		}
+		for _, u := range profile.Users {
+			uCopy := u
+			if err := uCopy.Validate(); err != nil {
+				errs = append(errs, fmt.Errorf("dns[%d].users: %w", i, err))
+			}
+		}
+		for _, g := range profile.Groups {
+			gCopy := g
+			if err := p.Groups.Contains(&gCopy); err != nil {
+				errs = append(errs, fmt.Errorf("dns[%d].groups: %w", i, err))
+			}
+		}
+		for _, t := range profile.Tags {
+			tCopy := t
+			if err := p.TagOwners.Contains(&tCopy); err != nil {
+				errs = append(errs, fmt.Errorf("dns[%d].tags: %w", i, err))
+			}
+		}
+	}
+	// No principal appears in two profiles' assignment lists.
+	seenGroup := make(map[Group]int)
+	seenUser := make(map[Username]int)
+	seenTag := make(map[Tag]int)
+	for i, profile := range p.DNS {
+		for _, g := range profile.Groups {
+			if prev, ok := seenGroup[g]; ok {
+				errs = append(errs, fmt.Errorf(
+					"group %q in dns[%d] and dns[%d]: %w",
+					g, prev, i, ErrDNSPrincipalAssignedTwice))
+			} else {
+				seenGroup[g] = i
+			}
+		}
+		for _, u := range profile.Users {
+			if prev, ok := seenUser[u]; ok {
+				errs = append(errs, fmt.Errorf(
+					"user %q in dns[%d] and dns[%d]: %w",
+					u, prev, i, ErrDNSPrincipalAssignedTwice))
+			} else {
+				seenUser[u] = i
+			}
+		}
+		for _, t := range profile.Tags {
+			if prev, ok := seenTag[t]; ok {
+				errs = append(errs, fmt.Errorf(
+					"tag %q in dns[%d] and dns[%d]: %w",
+					t, prev, i, ErrDNSPrincipalAssignedTwice))
+			} else {
+				seenTag[t] = i
+			}
+		}
 	}
 
 	if len(errs) > 0 {

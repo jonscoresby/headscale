@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -69,7 +70,7 @@ func TestReadConfig(t *testing.T) {
 					return nil, err
 				}
 
-				return dnsToTailcfgDNS(dns), nil
+				return dnsToTailcfgDNS(dns, MagicDNSConfig{}, false), nil
 			},
 			want: &tailcfg.DNSConfig{
 				Proxied: true,
@@ -135,7 +136,7 @@ func TestReadConfig(t *testing.T) {
 					return nil, err
 				}
 
-				return dnsToTailcfgDNS(dns), nil
+				return dnsToTailcfgDNS(dns, MagicDNSConfig{}, false), nil
 			},
 			want: &tailcfg.DNSConfig{
 				Proxied: false,
@@ -208,7 +209,7 @@ func TestReadConfig(t *testing.T) {
 					return nil, err
 				}
 
-				return dnsToTailcfgDNS(dns), nil
+				return dnsToTailcfgDNS(dns, MagicDNSConfig{}, false), nil
 			},
 			want: &tailcfg.DNSConfig{
 				Proxied: true,
@@ -599,5 +600,96 @@ func TestTrustedProxies(t *testing.T) {
 				t.Errorf("trustedProxies() mismatch (-want +got):\n%s", diff)
 			}
 		})
+	}
+}
+
+func TestEffectiveMagicDNSPrefersNewBlock(t *testing.T) {
+	dnsLegacy := DNSConfig{
+		MagicDNS:         false,
+		BaseDomain:       "legacy.example",
+		ExtraRecords:     []tailcfg.DNSRecord{{Name: "legacy-rec"}},
+		ExtraRecordsPath: "/legacy",
+	}
+	newBlock := MagicDNSConfig{
+		Enabled:    true,
+		BaseDomain: "new.example",
+	}
+	got := effectiveMagicDNS(dnsLegacy, newBlock, true)
+	if got.Enabled != true || got.BaseDomain != "new.example" {
+		t.Errorf("magic_dns block should win when set; got %+v", got)
+	}
+	if got.ExtraRecords != nil || got.ExtraRecordsPath != "" {
+		t.Errorf("when magic_dns block is set, legacy extra_records / path should not leak; got %+v", got)
+	}
+}
+
+func TestEffectiveMagicDNSFallsBackToLegacy(t *testing.T) {
+	dnsLegacy := DNSConfig{
+		MagicDNS:         true,
+		BaseDomain:       "legacy.example",
+		ExtraRecordsPath: "/legacy",
+	}
+	// magicDNSBlockPresent=false: operator did not set anything under the
+	// new block, so the legacy fields are the source of truth.
+	got := effectiveMagicDNS(dnsLegacy, MagicDNSConfig{}, false)
+	if got.Enabled != true || got.BaseDomain != "legacy.example" || got.ExtraRecordsPath != "/legacy" {
+		t.Errorf("empty magic_dns block should fall back to legacy fields; got %+v", got)
+	}
+}
+
+// TestEffectiveMagicDNSExplicitDisableHonored verifies that
+// `magic_dns.enabled: false` set by the operator is honored — i.e. the
+// presence-aware check distinguishes "set to false" from "not set", so
+// the legacy `dns.magic_dns: true` default does not silently win.
+func TestEffectiveMagicDNSExplicitDisableHonored(t *testing.T) {
+	dnsLegacy := DNSConfig{MagicDNS: true, BaseDomain: "legacy.example"}
+	disabledBlock := MagicDNSConfig{Enabled: false}
+	got := effectiveMagicDNS(dnsLegacy, disabledBlock, true)
+	if got.Enabled {
+		t.Errorf("explicit magic_dns.enabled=false should disable MagicDNS; got Enabled=%v", got.Enabled)
+	}
+}
+
+// TestLoadConfigForbidsMagicDNSConflict: a config with the new
+// magic_dns block AND any MagicDNS-overlapping field under legacy dns
+// is rejected at load time.
+func TestLoadConfigForbidsMagicDNSConflict(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	configContent := `
+noise:
+  private_key_path: ` + filepath.Join(tmpDir, "noise.key") + `
+server_url: "https://example.com"
+listen_addr: "127.0.0.1:8080"
+metrics_listen_addr: "127.0.0.1:9090"
+private_key_path: ` + filepath.Join(tmpDir, "private.key") + `
+database:
+  type: sqlite3
+  sqlite:
+    path: ` + filepath.Join(tmpDir, "headscale.db") + `
+prefixes:
+  v4: "100.64.0.0/10"
+  v6: "fd7a:115c:a1e0::/48"
+  allocation: sequential
+magic_dns:
+  enabled: true
+  base_domain: ts.example.com
+dns:
+  magic_dns: false
+  base_domain: legacy.example.com
+  override_local_dns: false
+`
+	require.NoError(t, os.WriteFile(configPath, []byte(configContent), 0o600))
+
+	viper.Reset()
+	viper.SetConfigFile(configPath)
+	require.NoError(t, LoadConfig(configPath, true))
+
+	_, err := LoadServerConfig()
+	if err == nil {
+		t.Fatal("expected error for magic_dns + dns.base_domain conflict, got nil")
+	}
+	if !strings.Contains(err.Error(), "MagicDNS settings configured in both") {
+		t.Errorf("unexpected error message: %v", err)
 	}
 }
