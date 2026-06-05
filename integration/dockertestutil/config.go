@@ -68,6 +68,12 @@ func ExtractRunIDFromContainerName(containerName string) string {
 func IsRunningInContainer() bool {
 	// Check for the common indicator that we're in a container
 	// This could be improved with more robust detection if needed
-	_, err := os.Stat("/.dockerenv")
-	return err == nil
+	if _, err := os.Stat("/.dockerenv"); err == nil {
+		return true
+	}
+	// Podman creates /run/.containerenv instead.
+	if _, err := os.Stat("/run/.containerenv"); err == nil {
+		return true
+	}
+	return false
 }

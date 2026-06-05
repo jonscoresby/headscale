@@ -478,8 +478,11 @@ func DockerAllowNetworkAdministration(config *docker.HostConfig) {
 	config.Privileged = true
 }
 
-// DockerMemoryLimit sets memory limit and disables OOM kill for containers.
+// DockerMemoryLimit sets memory limit for containers.
+//
+// Note: OOMKillDisable is intentionally not set. cgroup v2 has no
+// memory.oom.disable knob; runc silently ignores the option but crun
+// (used by podman) rejects it with an error.
 func DockerMemoryLimit(config *docker.HostConfig) {
 	config.Memory = 2 * 1024 * 1024 * 1024 // 2GB in bytes
-	config.OOMKillDisable = true
 }
